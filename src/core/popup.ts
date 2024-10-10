@@ -9,7 +9,7 @@ import { getLocalStorage, setLocalStorage, loadSettings, generalSettings, Settin
 import { escapeHtml, unescapeValue } from '../utils/string-utils';
 import { loadTemplates, createDefaultTemplate } from '../managers/template-manager';
 import browser from '../utils/browser-polyfill';
-import { detectBrowser, addBrowserClassToHtml } from '../utils/browser-detection';
+import { addBrowserClassToHtml } from '../utils/browser-detection';
 import { createElementWithClass } from '../utils/dom-utils';
 import { initializeInterpreter, handleInterpreterUI, collectPromptVariables } from '../utils/interpreter';
 import { adjustNoteNameHeight } from '../utils/ui-utils';
@@ -19,14 +19,15 @@ import { ensureContentScriptLoaded } from '../utils/content-script-utils';
 import { isBlankPage, isValidUrl } from '../utils/active-tab-manager';
 import { memoizeWithExpiration } from '../utils/memoize';
 import { debounce } from '../utils/debounce';
+import { AnyHighlightData } from '../utils/highlighter';
 
 let loadedSettings: Settings;
 let currentTemplate: Template | null = null;
 let templates: Template[] = [];
 let currentVariables: { [key: string]: string } = {};
 let currentTabId: number | undefined;
-let lastUsedTemplateId: string | null = null;
 let lastSelectedVault: string | null = null;
+let isHighlighterMode = false;
 
 const isSidePanel = window.location.pathname.includes('side-panel.html');
 
@@ -36,7 +37,7 @@ const memoizedReplaceVariables = memoizeWithExpiration(
 		return replaceVariables(tabId, template, variables, currentUrl);
 	},
 	{
-		expirationMs: 5000,
+		expirationMs: 500,
 		keyFn: (tabId: number, template: string, variables: { [key: string]: string }, currentUrl: string) => 
 			`${tabId}-${template}-${currentUrl}`
 	}
@@ -47,7 +48,7 @@ const memoizedGenerateFrontmatter = memoizeWithExpiration(
 	async (properties: Property[]) => {
 		return generateFrontmatter(properties);
 	},
-	{ expirationMs: 30000 }
+	{ expirationMs: 500 }
 );
 
 // Memoize extractPageContent with URL-sensitive key and short expiration
@@ -57,7 +58,7 @@ const memoizedExtractPageContent = memoizeWithExpiration(
 		return extractPageContent(tabId);
 	},
 	{ 
-		expirationMs: 5000, 
+		expirationMs: 500, 
 		keyFn: async (tabId: number) => {
 			const tab = await browser.tabs.get(tabId);
 			return `${tabId}-${tab.url}`;
@@ -124,13 +125,7 @@ async function initializeExtension(tabId: number) {
 		// Initialize triggers to speed up template matching
 		initializeTriggers(templates);
 
-		// Load last used template
-		lastUsedTemplateId = await getLocalStorage('lastUsedTemplateId');
-		if (lastUsedTemplateId) {
-			currentTemplate = templates.find(t => t.id === lastUsedTemplateId) || templates[0];
-		} else {
-			currentTemplate = templates[0];
-		}
+		currentTemplate = templates[0];
 		debugLog('Templates', 'Current template set to:', currentTemplate);
 
 		// Load last selected vault
@@ -139,6 +134,7 @@ async function initializeExtension(tabId: number) {
 			lastSelectedVault = loadedSettings.vaults[0];
 		}
 		debugLog('Vaults', 'Last selected vault:', lastSelectedVault);
+
 		updateVaultDropdown(loadedSettings.vaults);
 
 		const tab = await browser.tabs.get(tabId);
@@ -155,6 +151,8 @@ async function initializeExtension(tabId: number) {
 
 		// Setup message listeners
 		setupMessageListeners();
+
+		await checkHighlighterModeState(tabId);
 
 		return true;
 	} catch (error) {
@@ -195,7 +193,6 @@ async function loadAndSetupTemplates() {
 
 function setupMessageListeners() {
 	browser.runtime.onMessage.addListener((request: any, sender: browser.Runtime.MessageSender, sendResponse: (response?: any) => void) => {
-		console.log('Received message:', request);
 		if (request.action === "triggerQuickClip") {
 			handleClip().then(() => {
 				sendResponse({success: true});
@@ -221,11 +218,24 @@ function setupMessageListeners() {
 			} else {
 				showError('This page cannot be clipped. Only http and https URLs are supported.');
 			}
+		} else if (request.action === "highlightsUpdated") {
+			// Refresh fields when highlights are updated
+			if (currentTabId !== undefined) {
+				refreshFields(currentTabId);
+			}
+		} else if (request.action === "updatePopupHighlighterUI") {
+			isHighlighterMode = request.isActive;
+			updateHighlighterModeUI(request.isActive);
+		} else if (request.action === "highlighterModeChanged") {
+			isHighlighterMode = request.isActive;
+			updateHighlighterModeUI(isHighlighterMode);
 		}
 	});
 }
 
 document.addEventListener('DOMContentLoaded', async function() {
+	browser.runtime.connect({ name: 'popup' });
+
 	const refreshButton = document.getElementById('refresh-pane');
 	if (refreshButton) {
 		refreshButton.addEventListener('click', (e) => {
@@ -238,11 +248,7 @@ document.addEventListener('DOMContentLoaded', async function() {
 	if (settingsButton) {
 		settingsButton.addEventListener('click', async function() {
 			browser.runtime.openOptionsPage();
-			
-			const browserType = await detectBrowser();
-			if (browserType === 'firefox-mobile') {
-				setTimeout(() => window.close(), 50);
-			}
+			setTimeout(() => window.close(), 50);
 		});
 		initializeIcons(settingsButton);
 	}
@@ -302,6 +308,11 @@ function setupEventListeners(tabId: number) {
 				e.preventDefault();
 			}
 		});
+	}
+
+	const highlighterModeButton = document.getElementById('highlighter-mode');
+	if (highlighterModeButton) {
+		highlighterModeButton.addEventListener('click', () => toggleHighlighterMode(tabId));
 	}
 }
 
@@ -449,10 +460,6 @@ async function handleClip() {
 		}
 
 		await saveToObsidian(fileContent, noteName, path, selectedVault, currentTemplate.behavior);
-		
-		// Update last used template
-		lastUsedTemplateId = currentTemplate.id;
-		await setLocalStorage('lastUsedTemplateId', lastUsedTemplateId);
 
 		// Only update lastSelectedVault if the user explicitly chose a vault
 		if (!currentTemplate.vault) {
@@ -462,7 +469,7 @@ async function handleClip() {
 
 		// Only close the window if it's not running in side panel mode
 		if (!isSidePanel) {
-			setTimeout(() => window.close(), 1500);
+			setTimeout(() => window.close(), 500);
 		}
 	} catch (error) {
 		console.error('Error in handleClip:', error);
@@ -512,8 +519,8 @@ async function refreshFields(tabId: number, checkTemplateTriggers: boolean = tru
 		if (extractedData) {
 			const currentUrl = tab.url;
 
-			// Set the initial template to the last used one or the first template
-			currentTemplate = templates.find(t => t.id === lastUsedTemplateId) || templates[0];
+			// Set the initial template to the first template
+			currentTemplate = templates[0];
 			updateTemplateDropdown();
 
 			// Only check for the correct template if checkTemplateTriggers is true
@@ -536,7 +543,8 @@ async function refreshFields(tabId: number, checkTemplateTriggers: boolean = tru
 				extractedData.extractedContent,
 				currentUrl,
 				extractedData.schemaOrgData,
-				extractedData.fullHtml
+				extractedData.fullHtml,
+				extractedData.highlights || []
 			);
 			if (initializedContent) {
 				setupMetadataToggle();
@@ -677,7 +685,7 @@ async function initializeTemplateFields(currentTabId: number, template: Template
 	if (noteNameField) {
 		let formattedNoteName = await memoizedReplaceVariables(currentTabId!, template.noteNameFormat, variables, currentTabId ? await browser.tabs.get(currentTabId).then(tab => tab.url || '') : '');
 		noteNameField.setAttribute('data-template-value', template.noteNameFormat);
-		noteNameField.value = formattedNoteName;
+		noteNameField.value = formattedNoteName.trim();
 		adjustNoteNameHeight(noteNameField);
 	}
 
@@ -846,9 +854,55 @@ function refreshPopup() {
 
 function handleTemplateChange(templateId: string) {
 	currentTemplate = templates.find(t => t.id === templateId) || templates[0];
-	lastUsedTemplateId = currentTemplate.id;
-	setLocalStorage('lastUsedTemplateId', lastUsedTemplateId);
 	refreshFields(currentTabId!, false);
+}
+
+async function checkHighlighterModeState(tabId: number) {
+	try {
+		const result = await browser.storage.local.get('isHighlighterMode');
+		isHighlighterMode = result.isHighlighterMode as boolean;
+		updateHighlighterModeUI(isHighlighterMode);
+	} catch (error) {
+		console.error('Error checking highlighter mode state:', error);
+		// If there's an error, assume highlighter mode is off
+		isHighlighterMode = false;
+		updateHighlighterModeUI(false);
+	}
+}
+
+async function toggleHighlighterMode(tabId: number) {
+	const result = await browser.storage.local.get('isHighlighterMode');
+	const wasHighlighterModeActive = result.isHighlighterMode as boolean;
+	isHighlighterMode = !wasHighlighterModeActive;
+	await setLocalStorage('isHighlighterMode', isHighlighterMode);
+
+	// Send a message to the content script to toggle the highlighter mode
+	await browser.tabs.sendMessage(tabId, { 
+		action: "setHighlighterMode", 
+		isActive: isHighlighterMode 
+	});
+
+	// Notify the background script about the change
+	browser.runtime.sendMessage({ 
+		action: "highlighterModeChanged", 
+		isActive: isHighlighterMode 
+	});
+
+	// Close the popup if highlighter mode is turned on and not in side panel
+	if (isHighlighterMode && !wasHighlighterModeActive && !isSidePanel) {
+		window.close();
+	} else {
+		updateHighlighterModeUI(isHighlighterMode);
+	}
+}
+
+function updateHighlighterModeUI(isActive: boolean) {
+	const highlighterModeButton = document.getElementById('highlighter-mode');
+	if (highlighterModeButton) {
+		highlighterModeButton.classList.toggle('active', isActive);
+		highlighterModeButton.setAttribute('aria-pressed', isActive.toString());
+		highlighterModeButton.title = isActive ? 'Disable highlighter' : 'Enable highlighter';
+	}
 }
 
 // Update the resize event listener to use the debounced version

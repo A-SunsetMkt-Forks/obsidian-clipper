@@ -7,6 +7,7 @@ import browser from './browser-polyfill';
 import { debugLog } from './debug';
 import dayjs from 'dayjs';
 import { generalSettings } from '../utils/storage-utils';
+import { AnyHighlightData } from './highlighter';
 
 export function extractReadabilityContent(doc: Document): ReturnType<Readability['parse']> | null {
 	try {
@@ -162,12 +163,32 @@ interface ContentResponse {
 	extractedContent: ExtractedContent;
 	schemaOrgData: any;
 	fullHtml: string;
+	highlights: AnyHighlightData[];
 }
 
 export async function extractPageContent(tabId: number): Promise<ContentResponse | null> {
 	try {
 		const response = await browser.tabs.sendMessage(tabId, { action: "getPageContent" }) as ContentResponse;
 		if (response && response.content) {
+			// Ensure highlights are of the correct type
+			if (response.highlights && Array.isArray(response.highlights)) {
+				response.highlights = response.highlights.map((highlight: string | AnyHighlightData) => {
+					if (typeof highlight === 'string') {
+						// Convert string to AnyHighlightData
+						return {
+							type: 'text',
+							id: Date.now().toString(),
+							xpath: '',
+							content: highlight,
+							startOffset: 0,
+							endOffset: highlight.length
+						};
+					}
+					return highlight as AnyHighlightData;
+				});
+			} else {
+				response.highlights = [];
+			}
 			return response;
 		}
 		// Content script was unable to load
@@ -191,7 +212,7 @@ export function getMetaContent(doc: Document, attr: string, value: string): stri
 	return element ? element.getAttribute("content")?.trim() ?? "" : "";
 }
 
-export async function initializePageContent(content: string, selectedHtml: string, extractedContent: ExtractedContent, currentUrl: string, schemaOrgData: any, fullHtml: string) {
+export async function initializePageContent(content: string, selectedHtml: string, extractedContent: ExtractedContent, currentUrl: string, schemaOrgData: any, fullHtml: string, highlights: AnyHighlightData[]) {
 	try {
 		const parser = new DOMParser();
 		const doc = parser.parseFromString(content, 'text/html');
@@ -265,7 +286,10 @@ export async function initializePageContent(content: string, selectedHtml: strin
 			|| getMetaContent(doc, "name", "application-name")
 			|| '';
 
-		if (selectedHtml) {
+		if (highlights && highlights.length > 0) {
+			const highlightsContent = highlights.map(highlight => highlight.content).join('\n\n\n');
+			content = highlightsContent;
+		} else if (selectedHtml) {
 			content = selectedHtml;
 		} else if (readabilityArticle && readabilityArticle.content) {
 			content = readabilityArticle.content;
@@ -274,6 +298,9 @@ export async function initializePageContent(content: string, selectedHtml: strin
 		}
 
 		const markdownBody = createMarkdownContent(content, currentUrl);
+
+		// Convert each highlight to markdown individually and keep as an array
+		const markdownHighlights = highlights.map(highlight => createMarkdownContent(highlight.content, currentUrl));
 
 		const currentVariables: { [key: string]: string } = {
 			'{{author}}': authorName.trim(),
@@ -289,7 +316,8 @@ export async function initializePageContent(content: string, selectedHtml: strin
 			'{{published}}': published.trim(),
 			'{{site}}': site.trim(),
 			'{{title}}': title.trim(),
-			'{{url}}': currentUrl.trim()
+			'{{url}}': currentUrl.trim(),
+			'{{highlights}}': highlights.length > 0 ? JSON.stringify(markdownHighlights) : '',
 		};
 
 		// Add extracted content to variables

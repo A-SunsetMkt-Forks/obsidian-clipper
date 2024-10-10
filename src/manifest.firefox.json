@@ -2,13 +2,14 @@
 	"manifest_version": 3,
 	"name": "Obsidian Web Clipper",
 	"homepage_url": "https://obsidian.md/",
-	"version": "0.8.4",
+	"version": "0.9.1",
 	"description": "Save content from the web in a private and durable format that you can access offline. The official browser extension for Obsidian.",
 	"permissions": [
 		"activeTab",
 		"contextMenus",
 		"storage",
-		"scripting"
+		"scripting",
+		"webNavigation"
 	],
 	"action": {
 		"default_popup": "popup.html",
@@ -34,7 +35,8 @@
 	"content_scripts": [
 		{
 			"matches": ["http://*/*", "https://*/*"],
-			"js": ["content.js"]
+			"js": ["content.js"],
+			"css": ["highlighter.css"]
 		}
 	],
 	"content_security_policy": {
@@ -47,6 +49,13 @@
 				"mac": "Alt+Shift+O"
 			},
 			"description": "Open Obsidian Clipper"
+		},
+		"toggle_highlighter": {
+			"suggested_key": {
+				"default": "Alt+H",
+				"mac": "Alt+H"
+			},
+			"description": "Toggle highlighter mode"
 		}
 	},
 	"host_permissions": [
